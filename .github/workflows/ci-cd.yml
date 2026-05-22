@@ -1,0 +1,152 @@
+name: CI/CD – Test, Build, Push to ECR, Deploy to EC2
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# ---------------------------------------------------------------------------
+# Shared environment – references GitHub Variables (non-sensitive)
+# ---------------------------------------------------------------------------
+env:
+  AWS_REGION:       ${{ vars.AWS_REGION }}
+  AWS_ACCOUNT_ID:   ${{ vars.AWS_ACCOUNT_ID }}
+  ECR_REPOSITORY:   ${{ vars.ECR_REPOSITORY }}
+  EC2_USERNAME:     ${{ vars.EC2_USERNAME }}
+  CONTAINER_PORT:   ${{ vars.CONTAINER_PORT }}
+
+jobs:
+# ============================================================================
+# JOB 1 – Run the test suite
+# ============================================================================
+  test:
+    name: 🧪 Run Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Install all dependencies (including dev)
+        run: uv sync --frozen
+
+      - name: Run pytest with coverage
+        run: |
+          uv run pytest tests/ -v \
+            --cov=app \
+            --cov=main \
+            --cov-report=term-missing \
+            --cov-fail-under=70
+
+# ============================================================================
+# JOB 2 – Build Docker image and push to AWS ECR
+# ============================================================================
+  build-and-push:
+    name: 🐳 Build & Push to ECR
+    runs-on: ubuntu-latest
+    needs: test                       # only runs if test job passes
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    outputs:
+      image-uri: ${{ steps.set-image.outputs.image-uri }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push Docker image
+        id: set-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG:    ${{ github.sha }}
+        run: |
+          IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY"
+
+          echo "Building image: $IMAGE_URI:$IMAGE_TAG"
+
+          # Build the image
+          docker build -t "$IMAGE_URI:$IMAGE_TAG" -t "$IMAGE_URI:latest" .
+
+          # Push both tags
+          docker push "$IMAGE_URI:$IMAGE_TAG"
+          docker push "$IMAGE_URI:latest"
+
+          echo "image-uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"
+          echo "✅ Pushed $IMAGE_URI:$IMAGE_TAG and $IMAGE_URI:latest"
+
+# ============================================================================
+# JOB 3 – Deploy the new image to the EC2 instance
+# ============================================================================
+  deploy-to-ec2:
+    name: 🚀 Deploy to EC2
+    runs-on: ubuntu-latest
+    needs: build-and-push             # only runs if build job passes
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host:        ${{ secrets.EC2_HOST }}
+          username:    ${{ vars.EC2_USERNAME }}
+          key:         ${{ secrets.EC2_SSH_KEY }}
+          port:        22
+          script: |
+            set -e
+
+            ECR_REGISTRY="${{ vars.AWS_ACCOUNT_ID }}.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com"
+            IMAGE_URI="$ECR_REGISTRY/${{ vars.ECR_REPOSITORY }}"
+            CONTAINER_NAME="churn-api"
+            HOST_PORT="${{ vars.CONTAINER_PORT }}"
+            IMAGE_TAG="${{ github.sha }}"
+
+            echo "=== Logging into ECR ==="
+            aws ecr get-login-password --region ${{ vars.AWS_REGION }} \
+              | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+            echo "=== Pulling new image: $IMAGE_URI:$IMAGE_TAG ==="
+            docker pull "$IMAGE_URI:$IMAGE_TAG"
+
+            echo "=== Stopping old container (if running) ==="
+            docker stop "$CONTAINER_NAME" 2>/dev/null || true
+            docker rm   "$CONTAINER_NAME" 2>/dev/null || true
+
+            echo "=== Starting new container on port $HOST_PORT ==="
+            docker run -d \
+              --name "$CONTAINER_NAME" \
+              --restart unless-stopped \
+              -p "$HOST_PORT:8000" \
+              -e PYTHONUNBUFFERED=1 \
+              "$IMAGE_URI:$IMAGE_TAG"
+
+            echo "=== Waiting for health check ==="
+            sleep 10
+            docker exec "$CONTAINER_NAME" \
+              python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()" \
+              && echo "✅ Container is healthy!" \
+              || (echo "❌ Health check failed!" && docker logs "$CONTAINER_NAME" && exit 1)
+
+            echo "=== Cleaning up old images ==="
+            docker image prune -f
+
+            echo "🎉 Deployment complete! API running on port $HOST_PORT"
