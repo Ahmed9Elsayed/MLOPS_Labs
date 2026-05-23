@@ -9,6 +9,7 @@ dependencies = [
     "litestar[standard]>=2.21.1",
     "pandas>=2.0.0",
     "pydantic>=2.13.4",
+    "python-dotenv>=1.0.0",
     "scikit-learn>=1.8.0",
 ]
 

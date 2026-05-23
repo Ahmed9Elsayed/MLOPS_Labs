@@ -91,9 +91,9 @@ def predict_churn(
     has_cr_card: int,
     is_active_member: int,
     estimated_salary: float,
-) -> int:
+) -> tuple[int, float]:
     """
-    Take individual feature values and return a churn prediction (0 or 1).
+    Take individual feature values and return a churn prediction with confidence.
     Args:
         credit_score: Customer's credit score (300–850).
         geography: Country of residence – one of ``France``, ``Spain``, ``Germany``.
@@ -106,8 +106,9 @@ def predict_churn(
         is_active_member: Whether the customer is an active member (1 = yes, 0 = no).
         estimated_salary: Customer's estimated annual salary.
     Returns:
-        int: ``0`` – customer is **not** predicted to churn;
-             ``1`` – customer **is** predicted to churn.
+        tuple[int, float]: ``(prediction, churn_probability)``
+            - prediction: ``0`` – not predicted to churn; ``1`` – predicted to churn.
+            - churn_probability: model confidence (0.0–1.0) that customer churns.
     """
     global _preprocessor
     # Ensure the preprocessor is ready.
@@ -149,14 +150,17 @@ def predict_churn(
     # must NOT wrap the result in a named DataFrame (different column prefixes
     # would cause a ValueError).  Pass the raw array directly.
     prediction: int = int(model.predict(preprocessed_arr)[0])
+    # predict_proba returns [[prob_no_churn, prob_churn]] – we want churn probability.
+    churn_probability: float = float(model.predict_proba(preprocessed_arr)[0][1])
     logger.info(
-        "Prediction complete | result=%d | geography=%s gender=%s age=%.1f",
+        "Prediction complete | result=%d confidence=%.2f%% | geography=%s gender=%s age=%.1f",
         prediction,
+        churn_probability * 100,
         geography,
         gender,
         age,
     )
-    return prediction
+    return prediction, churn_probability
 # ---------------------------------------------------------------------------
 #   3: Sample features – run this module directly to smoke-test
 # ---------------------------------------------------------------------------
@@ -164,7 +168,7 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
     # Sample row 1 from the dataset (customer with Exited=1)
     print("Testing predict_churn function …")
-    result = predict_churn(
+    result, prob = predict_churn(
         credit_score=619.0,
         geography="France",
         gender="Female",
@@ -176,4 +180,5 @@ if __name__ == "__main__":
         is_active_member=1,
         estimated_salary=101_348.88,
     )
-    print(f"Prediction for sample customer: {result} ({'Churn' if result else 'No Churn'})")
+    label = "Churn" if result else "No Churn"
+    print(f"Prediction: {result} ({label}) | Churn probability: {prob:.1%}")
